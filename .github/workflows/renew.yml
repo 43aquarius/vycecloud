@@ -64,13 +64,13 @@ jobs:
 
     # 退出码: 0=成功 | 1=Cookie失效(硬错误, 浏览器也救不了) | 2=疑似被拦截(需要浏览器兜底)
 
-    - name: ❌ Cookie 失效，终止
+    - name: 🛑 Cookie 失效时终止（跳过=正常）
       if: ${{ steps.api_mode.outputs.exit_code == '1' }}
       run: |
         echo "❌ Cookie 已失效！请重新登录 https://vyce.cloud ，复制 __Host-vyce_sid 并更新仓库 Secrets"
         exit 1
 
-    - name: ❌ API 被拦截且未启用兜底
+    - name: 🛑 API 被拦截时终止（跳过=正常）
       if: ${{ github.event.inputs.force_mode == 'requests' && steps.api_mode.outputs.exit_code == '2' }}
       run: |
         echo "❌ API 模式疑似被拦截 (exit_code=2)，且 force_mode=requests 未启用浏览器兜底"
