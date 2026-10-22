@@ -237,6 +237,7 @@ def process_account(transport, acct):
     if cat == "blocked":
         result["outcome"] = "blocked"
         result["notes"].append(f"会话校验疑似被拦截 (HTTP {st})")
+        log(f"⚠️ 会话校验疑似被拦截 (HTTP {st}): {txt[:120]}")
         return result
     if cat != "ok":
         result["outcome"] = "auth" if cat == "auth" else "error"
@@ -254,6 +255,7 @@ def process_account(transport, acct):
     if cat != "ok":
         result["outcome"] = "blocked" if cat == "blocked" else ("auth" if cat == "auth" else "error")
         result["notes"].append(f"获取服务器列表失败 (HTTP {st}): {txt[:80]}")
+        log(f"⚠️ 获取服务器列表失败 (HTTP {st}, {cat}): {txt[:120]}")
         return result
     try:
         servers = (json.loads(txt) or {}).get("servers", []) or []
