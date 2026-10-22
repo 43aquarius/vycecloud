@@ -266,7 +266,7 @@ def process_account(transport, acct):
         result["notes"].append("账号下没有服务器，跳过")
         return result
 
-    renew_target_ids = []
+    renew_happened = False
     for sv in servers:
         sid_, name = sv.get("id", ""), sv.get("name", "?")
         status = sv.get("status", "?")
@@ -294,7 +294,7 @@ def process_account(transport, acct):
             if st2 == 200:
                 action = "✅ 续期成功"
                 log(f"✅ [{name}] 续期成功")
-                renew_target_ids.append(sid_)
+                renew_happened = True
             elif cat2 == "cooldown":
                 action = "🧊 24h 续期冷却中（此前已续期，正常）"
                 log(f"🧊 [{name}] {action}")
@@ -317,6 +317,8 @@ def process_account(transport, acct):
         result["servers"].append(item)
 
     # ---- 4. 续期后重新拉取，汇报最终状态 ----
+    if not renew_happened:
+        return result
     st3, txt3 = transport.get("/api/servers")
     if classify(st3, txt3) == "ok":
         try:
