@@ -1,0 +1,115 @@
+name: Vyce Auto Renew
+
+on:
+  schedule:
+    # 每天 UTC 02:00（北京时间 10:00）执行一次，每天都跑、到期即续，避免错过 48h 续期窗口
+    # vyce 续期冷却为 24h，每天一次恰好稳定续期；GitHub cron 有延迟也无妨（429 冷却被脚本视为正常）
+    - cron: '0 2 * * *'
+  workflow_dispatch:        # 允许手动触发测试
+    inputs:
+      force_mode:
+        description: '运行模式: auto=API优先+浏览器兜底 / requests=仅API / selenium=仅浏览器'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - requests
+          - selenium
+
+concurrency:
+  group: vyce-renew
+  cancel-in-progress: false
+
+jobs:
+  Renew-Vyce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write    # 用于清理历史运行记录
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: ⚙️ 设置 Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: 📦 安装基础依赖
+      run: pip install requests
+
+    # ============ 主模式：纯 API 直连（秒级完成） ============
+    - name: 🚀 API 模式续期 (requests)
+      id: api_mode
+      continue-on-error: true
+      if: ${{ github.event.inputs.force_mode != 'selenium' }}
+      env:
+        VYCE_COOKIE: ${{ secrets.VYCE_COOKIE }}
+        VYCE_COOKIES_JSON: ${{ secrets.VYCE_COOKIES_JSON }}
+        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      run: |
+        set +e
+        python app.py --mode requests
+        code=$?
+        set -e
+        echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+        if [ "$code" != "0" ]; then
+          exit $code
+        fi
+
+    # 退出码: 0=成功 | 1=Cookie失效(硬错误, 浏览器也救不了) | 2=疑似被拦截(需要浏览器兜底)
+
+    - name: ❌ Cookie 失效，终止
+      if: ${{ steps.api_mode.outputs.exit_code == '1' }}
+      run: |
+        echo "❌ Cookie 已失效！请重新登录 https://vyce.cloud ，复制 __Host-vyce_sid 并更新仓库 Secrets"
+        exit 1
+
+    - name: ❌ API 被拦截且未启用兜底
+      if: ${{ github.event.inputs.force_mode == 'requests' && steps.api_mode.outputs.exit_code == '2' }}
+      run: |
+        echo "❌ API 模式疑似被拦截 (exit_code=2)，且 force_mode=requests 未启用浏览器兜底"
+        exit 1
+
+    # ============ 兜底模式：SeleniumBase UC 浏览器（仅 API 模式失败时才安装/运行） ============
+    - name: 🛠️ 安装浏览器依赖（仅需要兜底时）
+      if: ${{ steps.api_mode.outputs.exit_code == '2' || github.event.inputs.force_mode == 'selenium' }}
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq xvfb x11-utils xdotool scrot fonts-noto-cjk
+        pip install seleniumbase
+        seleniumbase install chromedriver
+
+    - name: 🌐 浏览器模式续期 (Selenium 兜底)
+      if: ${{ steps.api_mode.outputs.exit_code == '2' || github.event.inputs.force_mode == 'selenium' }}
+      env:
+        VYCE_COOKIE: ${{ secrets.VYCE_COOKIE }}
+        VYCE_COOKIES_JSON: ${{ secrets.VYCE_COOKIES_JSON }}
+        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      run: |
+        xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+          python app.py --mode selenium
+
+    # ============ 清理历史运行记录（与 katabump 一致，仅保留最新一条） ============
+    - name: 🧹 清理旧的工作流运行记录
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+        count=0
+        for run_id in $runs; do
+          count=$((count + 1))
+          if [ $count -gt 1 ]; then
+            echo "删除运行记录: $run_id"
+            gh run delete $run_id || true
+          fi
+        done
