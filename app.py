@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vycebump — vyce.cloud 免费 VPS 自动续期保活（GitHub Action）
+vycecloud — vyce.cloud 免费 VPS 自动续期保活（GitHub Action）
 参考项目: https://github.com/zv201413/katabump
 
 两种运行模式（互为备份）:
@@ -491,7 +491,7 @@ def main():
     mode = args.mode
 
     log("#" * 46)
-    log("  vycebump — vyce.cloud 自动续期")
+    log("  vycecloud — vyce.cloud 自动续期")
     log(f"  模式: {mode} | 续期阈值: {RENEW_THRESHOLD_H}h")
     log("#" * 46)
 
