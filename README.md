@@ -1,4 +1,4 @@
-# vycebump 🔁
+# vycecloud 🔁
 
 **vyce.cloud 免费 VPS 自动续期保活** —— 通过 GitHub Actions 每天自动调用 vyce.cloud 的续期接口，让免费服务器永不过期。
 
