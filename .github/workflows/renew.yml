@@ -82,10 +82,12 @@ jobs:
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq xvfb x11-utils xdotool scrot fonts-noto-cjk
-        pip install seleniumbase
+        pip install seleniumbase pyautogui
+        # runner 自带 google-chrome(stable)，只需匹配版 chromedriver
+        google-chrome --version || true
         seleniumbase install chromedriver
 
-    - name: 🌐 浏览器模式续期 (Selenium 兜底)
+    - name: 🌐 浏览器模式续期 (UI 自动化过 Bestcap 验证码)
       if: ${{ steps.api_mode.outputs.exit_code == '2' || github.event.inputs.force_mode == 'selenium' }}
       env:
         VYCE_COOKIE: ${{ secrets.VYCE_COOKIE }}

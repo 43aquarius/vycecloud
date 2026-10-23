@@ -5,14 +5,15 @@ vycecloud — vyce.cloud 免费 VPS 自动续期保活（GitHub Action）
 参考项目: https://github.com/zv201413/katabump
 
 两种运行模式（互为备份）:
-  1. requests 模式（默认优先）: 纯 HTTP API 调用，秒级完成
-  2. selenium 模式（兜底）: SeleniumBase UC 浏览器在页面内 fetch 调用同一 API，
-     应对 requests 直连被 Cloudflare 拦截等异常场景
+  1. requests 模式: 纯 HTTP API 查询/续期（vyce 2026-10 新增续期 Bestcap 验证码后，
+     纯 API 续期报 missing_captcha → 退出码 2 交给浏览器模式）
+  2. selenium 模式: SeleniumBase UC 真实浏览器走 UI：点 Renew → 过 Bestcap
+     验证码（pyautogui 物理点击）→ token 回调自动续期。广告域名 DNS 屏蔽 + 弹窗劫持。
 
 用法:
-  python app.py --mode requests   # 仅 API 模式
-  python app.py --mode selenium   # 仅浏览器模式（需已安装 seleniumbase + chrome + xvfb）
-  python app.py --mode auto       # API 优先，被拦截时自动切浏览器（本地调试用）
+  python app.py --mode requests   # 仅 API（查询/降级检测）
+  python app.py --mode selenium   # UI 自动化续期（需 seleniumbase + chrome + Xvfb + pyautogui）
+  python app.py --mode auto       # API 优先，失败自动切 UI
 
 环境变量（建议全部通过 GitHub Secrets 注入）:
   VYCE_COOKIE         单账号: __Host-vyce_sid 的值（容忍完整 cookie 字符串格式）
@@ -204,6 +205,8 @@ def classify(status, body_text):
     响应分类:
       ok       200 成功
       cooldown 429 renewal_cooldown（24 小时冷却，属正常）
+      captcha  400 missing_captcha / invalid_captcha（续期接口已启用 Bestcap
+               验证码，纯 API 无法通过 → 需浏览器 UI 模式）
       auth     401/419 unauthenticated（Cookie 失效）
       blocked  网络异常/超时/403/5xx（疑似被拦截 → 值得浏览器兜底）
       error    其它硬错误
@@ -216,6 +219,8 @@ def classify(status, body_text):
         return "ok"
     if status == 429 and err == "renewal_cooldown":
         return "cooldown"
+    if status == 400 and err in ("missing_captcha", "invalid_captcha"):
+        return "captcha"
     if status in (401, 419) or err in ("unauthenticated", "unauthorized"):
         return "auth"
     if status in (-1, 0, 408, 429, 502, 503, 504) or 500 <= status <= 599 or status == 403:
@@ -300,6 +305,10 @@ def process_account(transport, acct):
             elif cat2 == "cooldown":
                 action = "🧊 24h 续期冷却中（此前已续期，正常）"
                 log(f"🧊 [{name}] {action}")
+            elif cat2 == "captcha":
+                action = "🔐 续期需过 Bestcap 验证码（纯 API 无法续期，需浏览器模式）"
+                log(f"🔐 [{name}] {action}")
+                result["outcome"] = "blocked"
             elif cat2 == "blocked":
                 action = f"⚠️ 续期请求疑似被拦截 (HTTP {st2})"
                 log(f"⚠️ [{name}] {action}")
@@ -363,34 +372,420 @@ def inject_session_cookie(sb, sid):
     return ok
 
 
+# ============ 浏览器 UI 自动化（Bestcap 验证码方案） ============
+#
+# vyce 2026-10 起对续期接口启用自研 Bestcap 验证码（captcha.vyceai.com）：
+#   POST /api/servers/{id}/renew 需要 captchaResponse=bestcap token，
+#   token 只能在真实浏览器里点击复选框（PoW+行为验证）获得。
+# 本方案：
+#   1. UC 反检测浏览器 + DNS 屏蔽第三方广告域（广告脚本会崩 driver / 弹窗遮挡）
+#   2. CDP 注入 cookie → 页面内 fetch 查询 API（GET 接口不需要验证码）
+#   3. 需续期时走 UI：JS 点 Renew → !important CSS 强制 bestcap 隐藏 iframe 可见
+#      → pyautogui 物理点击复选框（trusted 事件）→ state: idle→working→success
+#      → token 回调自动 POST 续期 → 挂钩的 fetch 捕获响应确认结果
+#   4. window.open 劫持防止广告弹窗盖住浏览器窗口
+
+AD_BLOCK_RULES = (
+    "--host-resolver-rules="
+    "MAP nap5k.com 127.0.0.1,"
+    "MAP n6wxm.com 127.0.0.1,"
+    "MAP jhnwr.com 127.0.0.1,"
+    "MAP ldrws.com 127.0.0.1,"
+    "MAP uplcm.com 127.0.0.1,"
+    "MAP t.me 127.0.0.1"
+)
+
+FORCE_CSS = (
+    "<style id='bc-force'>"
+    "iframe[src*='vyceai']{"
+    " width:400px !important;height:120px !important;"
+    " visibility:visible !important;opacity:1 !important;"
+    " position:relative !important;display:block !important;"
+    " min-width:400px !important;min-height:120px !important;"
+    " z-index:99999 !important;}"
+    "iframe[style*='2147483647']{display:none !important;}"
+    "</style>"
+)
+
+OBSERVER_JS = (
+    "if (!window.__bcObs) { window.__bcObs = new MutationObserver("
+    "mutations => { for (const m of mutations)"
+    " for (const n of m.addedNodes) {"
+    "  if (n.tagName === 'IFRAME' && (!n.src ||"
+    "      (!n.src.includes('vyceai') && !n.src.includes('ad.html')))) {"
+    "   const s = getComputedStyle(n);"
+    "   if (parseInt(s.zIndex) > 1000) n.remove();"
+    "  } } });"
+    " window.__bcObs.observe(document.documentElement,"
+    " {childList: true, subtree: true}); }"
+)
+
+BLOCK_POPUP_JS = (
+    "if (!window.__openBlocked) { window.__openBlocked = true;"
+    " window.__origOpen = window.open;"
+    " window.open = function() { return null; }; }"
+)
+
+HOOK_FETCH_JS = (
+    "if (!window.__fetchHooked) { window.__fetchHooked = true;"
+    " window.__renewResp = null;"
+    " const of = window.fetch;"
+    " window.fetch = function(...a) {"
+    "  const url = String(a[0]);"
+    "  if (url.includes('/renew')) {"
+    "   window.__renewResp = null;"
+    "   return of.apply(this, a).then(r => {"
+    "    try { r.clone().json().then(j => {"
+    "     window.__renewResp = {status: r.status, body: j};"
+    "    }).catch(()=>{}); } catch (e) {}"
+    "    return r;"
+    "   });"
+    "  }"
+    "  return of.apply(this, a);"
+    " }; }"
+)
+
+
+def get_chrome_display():
+    """从 chrome 进程 environ 读 DISPLAY（SB 可能自建 display，如 :1003）"""
+    import subprocess
+    try:
+        out = subprocess.run(["pgrep", "-f", "chrome"],
+                             capture_output=True, text=True).stdout or ""
+        for pid in out.split():
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as f:
+                    for e in f.read().decode("utf-8", "replace").split("\0"):
+                        if e.startswith("DISPLAY="):
+                            return e.split("=", 1)[1]
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+class UIBot:
+    """单账号浏览器 UI 续期机器人"""
+
+    def __init__(self, sb, acct):
+        self.sb = sb
+        self.d = sb.driver
+        self.acct = acct
+
+    # ---- 页面工具 ----
+
+    def fetch_json(self, path):
+        try:
+            return self.d.execute_script(
+                "return fetch(arguments[0]).then(r => r.ok ? r.json()"
+                " : null).catch(() => null);", path)
+        except Exception:
+            return None
+
+    def inject_all(self):
+        try:
+            self.d.execute_script(
+                "if (!document.getElementById('bc-force'))"
+                " document.head.insertAdjacentHTML('beforeend',"
+                " arguments[0]);", FORCE_CSS)
+            self.d.execute_script(OBSERVER_JS)
+            self.d.execute_script(BLOCK_POPUP_JS)
+            self.d.execute_script(HOOK_FETCH_JS)
+        except Exception:
+            pass
+
+    def clear_overlays(self):
+        try:
+            self.d.execute_script(
+                "document.querySelectorAll('iframe').forEach(f => {"
+                " const s = getComputedStyle(f);"
+                " if ((f.src && !f.src.includes('vyceai') &&"
+                "     !f.src.includes('ad.html') &&"
+                "     parseInt(s.zIndex) > 1000) ||"
+                "     (!f.src && s.position === 'fixed')) f.remove(); });")
+        except Exception:
+            pass
+
+    def measure_viewport(self):
+        g = json.loads(self.d.execute_script(
+            "return JSON.stringify({sx:window.screenX,sy:window.screenY,"
+            "ow:window.outerWidth,oh:window.outerHeight,"
+            "iw:window.innerWidth,ih:window.innerHeight});"))
+        return (g["sx"] + (g["ow"] - g["iw"]) / 2,
+                g["sy"] + (g["oh"] - g["ih"]))
+
+    # ---- 主流程 ----
+
+    def process(self):
+        acct = self.acct
+        result = {"label": acct["label"], "login": "",
+                  "outcome": "ok", "servers": [], "notes": []}
+        log("=" * 46)
+        log(f"🌐 [浏览器UI] 处理账号: {acct['label']}")
+
+        # 会话校验（页面内 fetch，GET 不需要验证码）
+        me = None
+        for _ in range(15):
+            me = self.fetch_json("/api/me")
+            if me and me.get("user"):
+                break
+            self.sb.sleep(1)
+        if not (me and me.get("user")):
+            result["outcome"] = "auth"
+            result["notes"].append("Cookie 已失效，请重新登录 vyce.cloud 更新 Secrets")
+            return result
+        result["login"] = me["user"].get("login", "")
+        log(f"👤 会话有效: {result['login']}")
+
+        # 等面板渲染完成（React 慢渲染/load 超时场景下 Renew 按钮出现才算就绪）
+        for _ in range(25):
+            if self.d.execute_script(
+                    "return [...document.querySelectorAll('button')]"
+                    ".some(b => (b.innerText||'').trim()==='Renew');"):
+                break
+            self.sb.sleep(1)
+        else:
+            result["notes"].append("面板未渲染出 Renew 按钮")
+            log("⚠️ 面板未就绪（未找到 Renew 按钮）")
+            return result
+
+        data = self.fetch_json("/api/servers")
+        servers = (data or {}).get("servers", []) or []
+        log(f"📦 共 {len(servers)} 台服务器")
+        if not servers:
+            result["notes"].append("账号下没有服务器，跳过")
+            return result
+
+        renew_happened = False
+        for sv in servers:
+            sid_, name = sv.get("id", ""), sv.get("name", "?")
+            status = sv.get("status", "?")
+            expires = sv.get("expiresAt")
+            paid_until = sv.get("paidUntil")
+            action = ""
+
+            if sv.get("abuseFrozen"):
+                action = "⚠️ 服务器被冻结(abuse)，请人工检查"
+            elif sv.get("suspended"):
+                action = "⚠️ 服务器被暂停: " + str(sv.get("suspendReason") or "原因未知")
+            elif paid_until and paid_until > now_ms():
+                action = f"💎 付费有效期内，跳过（至 {fmt_bj(paid_until)}）"
+            elif not expires:
+                action = "ℹ️ 无到期时间字段，跳过"
+            elif status == "stopped" and expires > now_ms():
+                action = f"⏸️ 已停止但未到期（剩 {fmt_left(expires)}），视为手动停止，跳过"
+            elif expires - now_ms() > RENEW_THRESHOLD_H * 3600000:
+                action = f"⏳ 有效期充足（{fmt_left(expires)}），无需续期"
+            else:
+                log(f"🔄 [{name}] UI 续期 ...")
+                ok, action = self.ui_renew_one(name)
+                if ok:
+                    renew_happened = True
+                elif action.startswith("❌"):
+                    result["outcome"] = "error"
+
+            result["servers"].append({
+                "id": sid_, "name": name, "os": sv.get("os", ""),
+                "region": sv.get("region", ""), "plan": sv.get("planId", ""),
+                "action": action, "status": status, "expires": expires})
+
+        # 刷新最终状态
+        if renew_happened:
+            data2 = self.fetch_json("/api/servers")
+            if data2:
+                try:
+                    final = {s.get("id"): s for s in data2.get("servers", []) or []}
+                    for item in result["servers"]:
+                        f = final.get(item.get("id"))
+                        if f:
+                            item["status"] = f.get("status", item["status"])
+                            item["expires"] = f.get("expiresAt", item["expires"])
+                except Exception:
+                    pass
+        return result
+
+    def ui_renew_one(self, name):
+        """对单台服务器执行 UI 续期：点 Renew → 过验证码 → 返回 (ok, action)"""
+        d, sb = self.d, self.sb
+        before = self.fetch_json("/api/servers") or {}
+        b_exp = None
+        for s in before.get("servers", []) or []:
+            if s.get("name") == name:
+                b_exp = s.get("expiresAt")
+                break
+
+        self.inject_all()
+        # pyautogui 绑定 Chrome 实际 display
+        disp = get_chrome_display() or os.environ.get("DISPLAY")
+        if disp:
+            os.environ["DISPLAY"] = disp
+        import pyautogui
+        pyautogui.PAUSE = 0.15
+
+        for rnd in range(1, 6):
+            # 打开续期对话框（JS 点击，原生点击会被遮挡）
+            self.inject_all()
+            self.clear_overlays()
+            d.execute_script(
+                "const b = [...document.querySelectorAll('button')]"
+                ".find(b => (b.innerText||'').trim() === 'Renew');"
+                "if (b) { b.click(); return true; } return false;")
+            sb.sleep(2)
+            self.inject_all()
+            self.clear_overlays()
+
+            # 等 bestcap iframe
+            frame = None
+            for _ in range(15):
+                fs = d.find_elements("css selector", "iframe[src*='vyceai']")
+                if fs:
+                    frame = fs[0]
+                    break
+                sb.sleep(1)
+            if not frame:
+                log(f"   [{name}] 第{rnd}轮: 验证码未出现，重试")
+                continue
+
+            # 坐标计算
+            try:
+                ifr = json.loads(d.execute_script(
+                    "const f=document.querySelector(\"iframe[src*='vyceai']\");"
+                    "const r=f.getBoundingClientRect();"
+                    "return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height});"))
+            except Exception:
+                continue
+            if ifr.get("w", 0) < 50:
+                sb.sleep(2)
+                continue
+            d.switch_to.frame(frame)
+            chk = None
+            try:
+                for _ in range(10):
+                    r = d.execute_script(
+                        "const c=document.getElementById('check');"
+                        "if(!c)return null;const b=c.getBoundingClientRect();"
+                        "return JSON.stringify({x:b.x,y:b.y,w:b.width,"
+                        "h:b.height});")
+                    if r:
+                        chk = json.loads(r)
+                        break
+                    time.sleep(1)
+                if not chk:
+                    d.switch_to.default_content()
+                    continue
+            finally:
+                d.switch_to.default_content()
+
+            vx = ifr["x"] + chk["x"] + chk["w"] / 2
+            vy = ifr["y"] + chk["y"] + chk["h"] / 2
+
+            # 落点验证
+            at_pt = d.execute_script(
+                "const el = document.elementFromPoint(arguments[0],"
+                " arguments[1]);"
+                "return el ? (el.tagName + '|' + (el.src || el.id || ''))"
+                " : 'null';", vx, vy) or ""
+            if "vyceai" not in at_pt:
+                self.clear_overlays()
+                time.sleep(0.3)
+            log(f"   [{name}] 第{rnd}轮: 点击复选框 (视口 {vx:.0f},{vy:.0f})")
+
+            # 物理点击（真实输入事件，过行为验证）
+            vp_x, vp_y = self.measure_viewport()
+            sx, sy = vp_x + vx, vp_y + vy
+            try:
+                pyautogui.moveTo(sx - 50, sy - 30, duration=0.25)
+                time.sleep(0.1)
+                pyautogui.moveTo(sx, sy, duration=0.2)
+                time.sleep(0.4)
+                pyautogui.mouseDown()
+                time.sleep(0.08)
+                pyautogui.mouseUp()
+            except Exception as e:
+                log(f"   [{name}] 物理点击异常: {e}")
+                continue
+
+            # 等 PoW + 自动续期（state: idle→working→success/verified）
+            deadline = time.time() + 50
+            while time.time() < deadline:
+                sb.sleep(3)
+                # 1) fetch 挂钩捕获 renew 响应（最可靠）
+                resp = None
+                try:
+                    resp = d.execute_script("return window.__renewResp || null;")
+                except Exception:
+                    pass
+                if resp:
+                    st = resp.get("status")
+                    err = (resp.get("body") or {}).get("error", "")
+                    if st == 200:
+                        log(f"   [{name}] ✅ 续期请求成功(HTTP 200)")
+                        return True, "✅ 续期成功（浏览器过验证码）"
+                    if st == 429 and err == "renewal_cooldown":
+                        log(f"   [{name}] 🧊 续期冷却中(此前已续期)")
+                        return True, "🧊 24h 续期冷却中（此前已续期，正常）"
+                    if st in (400,):
+                        log(f"   [{name}] 续期被拒: {err}")
+                        break
+                # 2) 兜底: expiresAt 变化
+                now_data = self.fetch_json("/api/servers") or {}
+                for s in now_data.get("servers", []) or []:
+                    if s.get("name") == name and s.get("expiresAt") and \
+                            b_exp and s["expiresAt"] > b_exp:
+                        log(f"   [{name}] ✅ expiresAt 已延长")
+                        return True, "✅ 续期成功（浏览器过验证码）"
+            # 本轮失败，重试下一轮（widget 会重渲染）
+        return False, "❌ 验证码多轮尝试未通过（可稍后重试）"
+
+
 def run_selenium_mode(accounts):
-    """SeleniumBase UC 浏览器兜底模式：逐账号注入 cookie 后在页面内 fetch API"""
+    """浏览器 UI 自动化模式：逐账号启动 UC 浏览器走完整续期流程"""
     from seleniumbase import SB  # 延迟导入，requests 模式无需安装
     results = []
-    with SB(uc=True, headless=False) as sb:
-        for acct in accounts:
-            log("=" * 46)
-            log(f"🌐 [浏览器] 处理 {acct['label']}")
-            r = None
-            for attempt in (1, 2):
-                try:
-                    sb.uc_open_with_reconnect(BASE_URL + "/", reconnect_time=4)
-                    sb.sleep(2)
-                    if not inject_session_cookie(sb, acct["sid"]):
-                        raise RuntimeError("cookie 注入失败")
-                    sb.open(BASE_URL + "/#/servers")
-                    sb.sleep(3)
-                    r = process_account(SeleniumTransport(sb), acct)
-                except Exception as e:
-                    log(f"⚠️ 浏览器模式第 {attempt} 次尝试异常: {e}")
-                    r = {"label": acct["label"], "login": "", "outcome": "error",
-                         "servers": [], "notes": [f"浏览器模式异常: {e}"]}
-                if r and r["outcome"] != "blocked":
-                    break
-                if attempt == 2 and r:
-                    r["notes"].append("浏览器模式重试后仍被拦截，请检查网络/换用代理")
-            results.append(r or {"label": acct["label"], "login": "", "outcome": "error",
-                                "servers": [], "notes": ["浏览器模式无结果"]})
+    for acct in accounts:
+        try:
+            with SB(uc=True, headless=False, locale_code="en-US",
+                    chromium_arg=AD_BLOCK_RULES) as sb:
+                d = sb.driver
+                # CDP 注入 cookie（不依赖页面加载状态）
+                d.execute_cdp_cmd("Network.setCookie", {
+                    "name": COOKIE_NAME,
+                    "value": acct["sid"],
+                    "url": BASE_URL + "/",
+                    "secure": True,
+                    "httpOnly": True,
+                })
+                # 打开面板（容忍 load 事件超时，DOM 可用即可）
+                d.set_page_load_timeout(40)
+                for nav in range(2):
+                    try:
+                        d.get(BASE_URL + "/")
+                    except Exception:
+                        log("ℹ️ 页面 load 事件超时，继续（DOM 已可用）")
+                    # 等 React 面板渲染（最长 60s）
+                    ready = False
+                    for _ in range(60):
+                        try:
+                            rs = d.execute_script(
+                                "return document.readyState + '|' +"
+                                " (document.querySelectorAll('button').length"
+                                " > 3 ? 'Y' : 'N');")
+                            if rs and rs.endswith("|Y"):
+                                ready = True
+                                break
+                        except Exception:
+                            pass
+                        sb.sleep(1)
+                    if ready:
+                        break
+                    log(f"ℹ️ 第{nav+1}次导航后面板未渲染，重试")
+                results.append(UIBot(sb, acct).process())
+        except Exception as e:
+            log(f"⚠️ [浏览器UI] {acct['label']} 异常: {e}")
+            results.append({"label": acct["label"], "login": "",
+                            "outcome": "error", "servers": [],
+                            "notes": [f"浏览器模式异常: {e}"]})
     return results
 
 
