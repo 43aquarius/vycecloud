@@ -814,8 +814,19 @@ def run_selenium_mode(accounts):
                 st2, tx2 = t.get("/api/servers")
                 if st2 == 200:
                     pre["/api/servers"] = tx2
+                st3, tx3 = t.get("/api/config")
+                if st3 == 200:
+                    pre["/api/config"] = tx3
             except Exception:
                 pass
+            # config 兜底（bestcapSitekey 是 React 初始化关键依赖）
+            if "/api/config" not in pre:
+                pre["/api/config"] = json.dumps({
+                    "github": True, "devLogin": False,
+                    "minAccountAgeDays": 30, "signupsEnabled": True,
+                    "freeServersEnabled": True, "maintenanceBanner": "",
+                    "enabledPlans": ["mini", "plus", "pro"],
+                    "bestcapSitekey": "bc_site_b05a3b42a31232929d6194f3"})
 
             with SB(uc=True, headless=False, locale_code="en-US",
                     chromium_arg=AD_BLOCK_RULES) as sb:
