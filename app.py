@@ -543,8 +543,7 @@ class UIBot:
         result["login"] = me["user"].get("login", "")
         log(f"👤 会话有效: {result['login']}")
 
-        # 等 bestcap.js 全局库就绪（不依赖 React 面板渲染——
-        # 面板初始化请求悬挂时 React 卡 Loading，但 bestcap.js 是全局 script）
+        # 等 bestcap.js 全局库就绪（不依赖 React 面板渲染）
         bc_ready = False
         for _ in range(30):
             try:
@@ -565,7 +564,17 @@ class UIBot:
         cfg = self.fetch_json("/api/config") or {}
         self.sitekey = (cfg.get("bestcapSitekey")
                         or "bc_site_b05a3b42a31232929d6194f3")
-        log(f"🧩 bestcap 就绪, sitekey={self.sitekey[:20]}...")
+        # React 面板是否渲染出 Renew 按钮（决定续期路径）
+        self.panel_ready = False
+        for _ in range(20):
+            if self.d.execute_script(
+                    "return [...document.querySelectorAll('button')]"
+                    ".some(b => (b.innerText||'').trim()==='Renew');"):
+                self.panel_ready = True
+                break
+            self.sb.sleep(1)
+        log(f"🧩 bestcap 就绪, sitekey={self.sitekey[:20]}..., "
+            f"React面板={'✅' if self.panel_ready else '❌(走自渲染兜底)'}")
 
         data = self.fetch_json("/api/servers")
         servers = (data or {}).get("servers", []) or []
@@ -623,8 +632,15 @@ class UIBot:
         return result
 
     def ui_renew_one(self, name):
-        """对单台服务器执行续期：自渲染 bestcap 验证码 → 物理点击 →
-        token 回调里页面内 fetch POST /renew（同源带 Origin,过验证码）"""
+        """对单台服务器执行续期。
+        路径A(面板就绪): 点 Renew → React 对话框 bestcap → 物理点击 →
+          token 回调自动 POST /renew（2026-10-23 本地实测完整成功）
+        路径B(自渲染兜底): bestcap.render 自建组件 → 物理点击 →
+          callback 内页面内 fetch POST /renew"""
+        return self._renew_via_panel(name)
+
+    def _renew_via_panel(self, name):
+        """React 面板 Renew 对话框路径（2026-10-23 本地实测完整成功）"""
         d, sb = self.d, self.sb
         sid_ = None
         before = self.fetch_json("/api/servers") or {}
@@ -642,86 +658,63 @@ class UIBot:
         import pyautogui
         pyautogui.PAUSE = 0.15
 
-        for rnd in range(1, 5):
-            # 自渲染 bestcap 组件（拆成小步执行，避免 renderer 超时）
-            try:
-                d.set_script_timeout(90)
-                # 步骤1: 清理旧组件 + 创建容器
-                d.execute_script(
-                    "const o = document.getElementById('bc-holder');"
-                    "if (o) o.remove();"
-                    "window.__bcToken = null; window.__renewDone = null;"
-                    "const h = document.createElement('div');"
-                    "h.id = 'bc-holder';"
-                    "h.style.cssText = 'position:fixed;left:120px;top:120px;"
-                    "z-index:2147483647;background:#fff;padding:12px;';"
-                    "document.body.appendChild(h);")
-                # 步骤2: 渲染 bestcap（token 回调内直接 fetch 续期）
-                ok = d.execute_script(
-                    "const sid = arguments[0], sk = arguments[1];"
-                    "try {"
-                    " window.bestcap.render("
-                    "  document.getElementById('bc-holder'), {"
-                    "   sitekey: sk,"
-                    "   callback: function(token) {"
-                    "    window.__bcToken = token;"
-                    "    fetch('/api/servers/' + sid + '/renew', {"
-                    "     method: 'POST', credentials: 'include',"
-                    "     headers: {'Content-Type': 'application/json'},"
-                    "     body: JSON.stringify({captchaResponse: token})"
-                    "    }).then(function(r) {"
-                    "     return r.json().then(function(j) {"
-                    "      window.__renewDone = {status: r.status, body: j};"
-                    "     });"
-                    "    }).catch(function(e) {"
-                    "     window.__renewDone = "
-                    "      {status: -1, body: {error: String(e)}};"
-                    "    });"
-                    "   },"
-                    "   'expired-callback': function() {"
-                    "    window.__bcToken = null; },"
-                    "   'error-callback': function() {"
-                    "    window.__bcToken = null; }"
-                    "  });"
-                    " return true;"
-                    "} catch (e) { return 'err:' + e; }", sid_, self.sitekey)
-            except Exception as e:
-                log(f"   [{name}] 组件渲染异常: {str(e)[:60]}")
-                sb.sleep(2)
-                continue
-            if ok is not True:
-                log(f"   [{name}] bestcap.render 失败: {ok}")
-                sb.sleep(2)
-                continue
-            sb.sleep(4)  # 等 iframe 挑战加载
+        before = self.fetch_json("/api/servers") or {}
+        b_exp = None
+        for s in before.get("servers", []) or []:
+            if s.get("name") == name:
+                b_exp = s.get("expiresAt")
+        self.inject_all()
+        disp = get_chrome_display() or os.environ.get("DISPLAY")
+        if disp:
+            os.environ["DISPLAY"] = disp
+        import pyautogui
+        pyautogui.PAUSE = 0.15
 
-            # 找 bestcap iframe 并物理点击复选框
+        for rnd in range(1, 5):
+            # 路径A: 点 Renew 打开对话框（JS 点击，原生会被遮挡）
+            self.inject_all()
+            self.clear_overlays()
+            d.execute_script(
+                "const b = [...document.querySelectorAll('button')]"
+                ".find(b => (b.innerText||'').trim() === 'Renew');"
+                "if (b) { b.click(); return true; } return false;")
+            sb.sleep(2)
+            self.inject_all()
+            self.clear_overlays()
+
+            # 对话框里的 bestcap iframe
             frame = None
-            for _ in range(12):
+            for _ in range(20):
                 fs = d.find_elements("css selector",
-                                     "#bc-holder iframe[src*='vyceai']")
+                                     "iframe[src*='vyceai']")
                 if fs:
                     frame = fs[0]
                     break
                 sb.sleep(1)
             if not frame:
-                log(f"   [{name}] 第{rnd}轮: 组件 iframe 未出现")
+                log(f"   [{name}] 第{rnd}轮: 验证码未出现")
                 continue
 
-            # 坐标：holder 固定在 (120,120)，iframe 内 check 相对坐标
+            # 坐标：iframe 自身 rect（不能用 holder rect——含 padding 偏移）
             try:
                 ifr = json.loads(d.execute_script(
-                    "const f=document.querySelector("
-                    ""#bc-holder iframe[src*='vyceai']");"
-                    "const r=f.getBoundingClientRect();"
-                    "return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height});"))
-            except Exception:
+                    'const f=document.querySelector('
+                    '"#bc-holder iframe[src*=\'vyceai\']");'
+                    'if(!f) return null;'
+                    'const r=f.getBoundingClientRect();'
+                    'return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height});'))
+            except Exception as e:
+                log(f"   [{name}] 第{rnd}轮: iframe rect 异常: {str(e)[:50]}")
+                sb.sleep(2)
+                continue
+            if not ifr:
+                log(f"   [{name}] 第{rnd}轮: iframe rect 为空")
                 sb.sleep(2)
                 continue
             d.switch_to.frame(frame)
             chk = None
             try:
-                for _ in range(10):
+                for _ in range(25):
                     r = d.execute_script(
                         "const c=document.getElementById('check');"
                         "if(!c)return null;const b=c.getBoundingClientRect();"
@@ -734,12 +727,13 @@ class UIBot:
             finally:
                 d.switch_to.default_content()
             if not chk:
+                log(f"   [{name}] 第{rnd}轮: 复选框未渲染")
                 continue
 
             vx = ifr["x"] + chk["x"] + chk["w"] / 2
             vy = ifr["y"] + chk["y"] + chk["h"] / 2
             vp_x, vp_y = self.measure_viewport()
-            log(f"   [{name}] holder={ifr} check={chk} "
+            log(f"   [{name}] iframe={ifr} check={chk} "
                 f"→ 视口({vx:.0f},{vy:.0f})")
             sx, sy = vp_x + vx, vp_y + vy
             log(f"   [{name}] 第{rnd}轮: 物理点击复选框 ({sx:.0f},{sy:.0f})")
@@ -775,6 +769,14 @@ class UIBot:
                         "return window.__renewDone || null;")
                 except Exception:
                     done = None
+                # 路径A核心判定：expiresAt 变化（React 自行 POST 了续期）
+                if not done and b_exp:
+                    now_data = self.fetch_json("/api/servers") or {}
+                    for s in now_data.get("servers", []) or []:
+                        if s.get("name") == name and s.get("expiresAt") \
+                                and s["expiresAt"] > b_exp:
+                            log(f"   [{name}] ✅ expiresAt 已延长（续期成功）")
+                            return True, "✅ 续期成功（浏览器过验证码）"
                 if done:
                     st = done.get("status")
                     err = (done.get("body") or {}).get("error", "")
@@ -802,6 +804,19 @@ def run_selenium_mode(accounts):
     results = []
     for acct in accounts:
         try:
+            # 先用 requests 预取 me/servers 真实数据（供 fetch mock 注入）
+            pre = {}
+            try:
+                t = RequestsTransport(acct["sid"])
+                st1, tx1 = t.get("/api/me")
+                if st1 == 200:
+                    pre["/api/me"] = tx1
+                st2, tx2 = t.get("/api/servers")
+                if st2 == 200:
+                    pre["/api/servers"] = tx2
+            except Exception:
+                pass
+
             with SB(uc=True, headless=False, locale_code="en-US",
                     chromium_arg=AD_BLOCK_RULES) as sb:
                 d = sb.driver
@@ -813,8 +828,42 @@ def run_selenium_mode(accounts):
                     "secure": True,
                     "httpOnly": True,
                 })
-                # 打开页面（容忍 load 超时；只需 bestcap.js 加载即可，
-                # React 面板渲染不是必须的——续期走自渲染组件路径）
+                # 预注入 fetch mock：React 初始化的 me/servers 请求立即返回
+                # 真实数据（网络悬挂会让 React 卡 Loading/误判未登录）
+                if pre:
+                    mock_js = (
+                        "const __mock = " + json.dumps(pre) + ";"
+                        "const __of = window.fetch;"
+                        "window.fetch = function(url) {"
+                        " const u = String(url);"
+                        " for (const k in __mock) {"
+                        "  if (u.includes(k)) {"
+                        "   const body = __mock[k];"
+                        "   return Promise.resolve({"
+                        "    ok: true, status: 200,"
+                        "    json: () => Promise.resolve(JSON.parse(body)),"
+                        "    text: () => Promise.resolve(body)"
+                        "   });"
+                        "  }"
+                        " }"
+                        " return __of.apply(this, arguments);"
+                        "};")
+                    try:
+                        d.execute_cdp_cmd(
+                            "Page.addScriptToEvaluateOnNewDocument",
+                            {"source": mock_js})
+                    except Exception as e:
+                        log(f"⚠️ fetch mock 注入失败(不影响运行): {e}")
+                # 屏蔽非关键 API：这些初始化请求悬挂会让 React 卡 Loading、
+                # 主线程阻塞 → 物理点击事件无法分发。屏蔽后 React 快速渲染
+                d.execute_cdp_cmd("Network.enable", {})
+                d.execute_cdp_cmd("Network.setBlockedURLs", {"urls": [
+                    "*://vyce.cloud/api/stock",
+                    "*://vyce.cloud/api/keys",
+                    "*://vyce.cloud/api/credits",
+                    "*://vyce.cloud/api/billing",
+                ]})
+                # 打开页面（容忍 load 超时）
                 d.set_page_load_timeout(45)
                 for nav in range(3):
                     try:
@@ -826,10 +875,12 @@ def run_selenium_mode(accounts):
                         except Exception:
                             pass
                     ready = False
-                    for _ in range(30):
+                    for _ in range(35):
                         try:
                             if d.execute_script(
-                                    "return typeof window.bestcap === 'object';"):
+                                    "return typeof window.bestcap === 'object' &&"
+                                    " document.body &&"
+                                    " document.body.innerText.length > 10;"):
                                 ready = True
                                 break
                         except Exception:
@@ -837,7 +888,7 @@ def run_selenium_mode(accounts):
                         sb.sleep(1)
                     if ready:
                         break
-                    log(f"ℹ️ 第{nav+1}次导航后 bestcap 未就绪，重试")
+                    log(f"ℹ️ 第{nav+1}次导航后页面未就绪，重试")
                 results.append(UIBot(sb, acct).process())
         except Exception as e:
             log(f"⚠️ [浏览器UI] {acct['label']} 异常: {e}")
