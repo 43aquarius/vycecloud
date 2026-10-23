@@ -24,7 +24,7 @@ concurrency:
 jobs:
   Renew-Vyce:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       actions: write    # 用于清理历史运行记录
       contents: read
@@ -83,9 +83,13 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq xvfb x11-utils xdotool scrot fonts-noto-cjk
         pip install seleniumbase pyautogui
-        # runner 自带 google-chrome(stable)，只需匹配版 chromedriver
-        google-chrome --version || true
-        seleniumbase install chromedriver
+        # 新版 runner 镜像不再自带 google-chrome：安装 Chrome for Testing
+        # (seleniumbase 会自动匹配同版本 uc_driver/chromedriver)
+        seleniumbase install chrome
+        CFT=$(python -c "import seleniumbase,os;print(os.path.join(
+          os.path.dirname(seleniumbase.__file__),'drivers','chrome-linux64','chrome'))")
+        sudo ln -sf "$CFT" /usr/local/bin/google-chrome
+        google-chrome --version
 
     - name: 🌐 浏览器模式续期 (UI 自动化过 Bestcap 验证码)
       if: ${{ steps.api_mode.outputs.exit_code == '2' || github.event.inputs.force_mode == 'selenium' }}
