@@ -5,15 +5,16 @@ vycecloud — vyce.cloud 免费 VPS 自动续期保活（GitHub Action）
 参考项目: https://github.com/zv201413/katabump
 
 两种运行模式（互为备份）:
-  1. requests 模式: 纯 HTTP API 查询/续期（vyce 2026-10 新增续期 Bestcap 验证码后，
-     纯 API 续期报 missing_captcha → 退出码 2 交给浏览器模式）
+  1. requests 模式: 纯 HTTP API 检查 —— 续期接口已启用 Bestcap 验证码，纯 API 无法
+     续期；本模式只查会话/服务器列表/剩余时长，发现有服务器需续期时以退出码 2
+     交浏览器模式处理（不再尝试 API 直接续期）
   2. selenium 模式: SeleniumBase UC 真实浏览器走 UI：点 Renew → 过 Bestcap
      验证码（pyautogui 物理点击）→ token 回调自动续期。广告域名 DNS 屏蔽 + 弹窗劫持。
 
 用法:
-  python app.py --mode requests   # 仅 API（查询/降级检测）
+  python app.py --mode requests   # 仅 API 检查（不发起续期；需续期时 exit 2）
   python app.py --mode selenium   # UI 自动化续期（需 seleniumbase + chrome + Xvfb + pyautogui）
-  python app.py --mode auto       # API 优先，失败自动切 UI
+  python app.py --mode auto       # API 检查，需续期时自动切 UI
 
 环境变量（建议全部通过 GitHub Secrets 注入）:
   VYCE_COOKIE         单账号: __Host-vyce_sid 的值（容忍完整 cookie 字符串格式）
@@ -21,9 +22,9 @@ vycecloud — vyce.cloud 免费 VPS 自动续期保活（GitHub Action）
   TG_BOT_TOKEN / TG_CHAT_ID      Telegram 通知（可选）
   SERVERCHAN_SENDKEY             Server酱 微信通知（可选）
   PUSHPLUS_TOKEN                 PushPlus 微信通知（可选）
-  VYCE_RENEW_THRESHOLD_HOURS     续期阈值，默认 40（剩余不足该小时数才发起续期）
+  VYCE_RENEW_THRESHOLD_HOURS     检查阈值，默认 40（剩余不足该小时数时标记需浏览器续期）
 
-退出码: 0=成功  1=Cookie 失效/硬错误（浏览器也救不了）  2=疑似被拦截（建议 Selenium 兜底）
+退出码: 0=无需处理  1=Cookie 失效/硬错误（浏览器也救不了）  2=有服务器需续期（须 Selenium 浏览器模式）
 """
 
 import os
@@ -129,7 +130,7 @@ def load_accounts():
 # ============ HTTP 传输层 ============
 
 class RequestsTransport:
-    """纯 requests 直连 vyce API"""
+    """纯 requests 直连 vyce API（仅 GET 查询；续期必须走浏览器 UI 过验证码）"""
 
     def __init__(self, sid):
         self.sess = requests.Session()
@@ -155,53 +156,10 @@ class RequestsTransport:
     def get(self, path):
         return self._call("GET", path)
 
-    def post_json(self, path, payload):
-        return self._call("POST", path, payload)
 
-
-# 页面内 fetch：同源请求自动携带 cookie，TLS/JA3 指纹与真实浏览器一致
-_INPAGE_FETCH_JS = """
-const [path, method, bodyStr] = arguments;
-const done = arguments[arguments.length - 1];
-const opts = {method: method, credentials: 'include'};
-if (bodyStr !== null) {
-    opts.headers = {'Content-Type': 'application/json'};
-    opts.body = bodyStr;
-}
-fetch(path, opts)
-    .then(async r => done({status: r.status, body: await r.text()}))
-    .catch(e => done({status: -1, body: String(e)}));
-"""
-
-
-class SeleniumTransport:
-    """通过已登录浏览器执行同源 fetch"""
-
-    def __init__(self, sb):
-        self.sb = sb
-        try:
-            sb.driver.set_script_timeout(90)
-        except Exception:
-            pass
-
-    def _call(self, method, path, payload=None):
-        body = None if payload is None else json.dumps(payload)
-        try:
-            res = self.sb.driver.execute_async_script(_INPAGE_FETCH_JS, path, method, body)
-        except Exception as e:
-            return -1, f"execute_async_script failed: {e}"
-        if not isinstance(res, dict):
-            return -1, "no-response"
-        try:
-            return int(res.get("status", -1)), str(res.get("body", ""))
-        except Exception:
-            return -1, "bad-response"
-
-    def get(self, path):
-        return self._call("GET", path)
-
-    def post_json(self, path, payload):
-        return self._call("POST", path, payload)
+# 注: 旧的页面内 fetch 直发续期 POST 传输层（SeleniumTransport）已删除——
+# 续期接口 2026-10 起强制 Bestcap 验证码，无 token 的 POST 一律 400，
+# 续期只能走浏览器 UI 点击（见 UIBot._renew_via_panel）。
 
 
 def classify(status, body_text):
@@ -232,10 +190,12 @@ def classify(status, body_text):
     return "error"
 
 
-# ============ 核心续期逻辑（两种传输层共用） ============
+# ============ requests 检查逻辑（会话/列表/阈值决策，不发起续期） ============
 
 def process_account(transport, acct):
-    """处理单个账号：校验会话 → 拉取服务器列表 → 逐台决策续期 → 汇报最终状态"""
+    """处理单个账号（requests 检查路径）：校验会话 → 拉取服务器列表 → 逐台决策；
+    需续期的直接标记退出码 2 交浏览器模式（续期接口已启用 Bestcap 验证码，
+    纯 API 无法发起续期）"""
     result = {"label": acct["label"], "login": "", "outcome": "ok", "servers": [], "notes": []}
     log("=" * 46)
     log(f"🧾 处理账号: {acct['label']}")
@@ -277,7 +237,6 @@ def process_account(transport, acct):
         result["notes"].append("账号下没有服务器，跳过")
         return result
 
-    renew_happened = False
     for sv in servers:
         sid_, name = sv.get("id", ""), sv.get("name", "?")
         status = sv.get("status", "?")
@@ -298,55 +257,16 @@ def process_account(transport, acct):
         elif expires - now_ms() > RENEW_THRESHOLD_H * 3600000:
             action = f"⏳ 有效期充足（{fmt_left(expires)}），无需续期"
         else:
-            # ---- 3. 发起续期 ----
-            log(f"🔄 [{name}] 发起续期 ...")
-            st2, txt2 = transport.post_json(f"/api/servers/{sid_}/renew", {})
-            cat2 = classify(st2, txt2)
-            if st2 == 200:
-                action = "✅ 续期成功"
-                log(f"✅ [{name}] 续期成功")
-                renew_happened = True
-            elif cat2 == "cooldown":
-                action = "🧊 24h 续期冷却中（此前已续期，正常）"
-                log(f"🧊 [{name}] {action}")
-            elif cat2 == "captcha":
-                action = "🔐 续期需过 Bestcap 验证码（纯 API 无法续期，需浏览器模式）"
-                log(f"🔐 [{name}] {action}")
-                result["outcome"] = "blocked"
-            elif cat2 == "blocked":
-                action = f"⚠️ 续期请求疑似被拦截 (HTTP {st2})"
-                log(f"⚠️ [{name}] {action}")
-                result["outcome"] = "blocked"
-            elif cat2 == "auth":
-                action = "❌ Cookie 已失效"
-                result["outcome"] = "auth"
-            else:
-                action = f"❌ 续期失败 (HTTP {st2}): {txt2[:60]}"
-                log(action)
-                if result["outcome"] == "ok":
-                    result["outcome"] = "error"
+            # ---- 3. 需续期：续期接口已启用 Bestcap 验证码，纯 API 无法发起，
+            #      直接标记交浏览器模式（workflow 据退出码 2 触发 Selenium 兜底）----
+            action = f"🔐 待续期（{fmt_left(expires)}），须浏览器过 Bestcap 验证码"
+            log(f"🔐 [{name}] {action}")
+            result["outcome"] = "blocked"
 
         item = {"id": sid_, "name": name, "os": sv.get("os", ""), "region": sv.get("region", ""),
                 "plan": sv.get("planId", ""), "action": action,
                 "status": status, "expires": expires}
         result["servers"].append(item)
-
-    # ---- 4. 续期后重新拉取，汇报最终状态 ----
-    if not renew_happened:
-        return result
-    st3, txt3 = transport.get("/api/servers")
-    if classify(st3, txt3) == "ok":
-        try:
-            final = {s.get("id"): s for s in (json.loads(txt3) or {}).get("servers", []) or []}
-            for item in result["servers"]:
-                f = final.get(item.get("id"))
-                if f:
-                    item["status"] = f.get("status", item["status"])
-                    item["expires"] = f.get("expiresAt", item["expires"])
-                    if f.get("hostIssue"):
-                        item["action"] += f" | 主机异常: {f['hostIssue']}"
-        except Exception as e:
-            log(f"⚠️ 刷新最终状态失败(不影响结果): {e}")
 
     return result
 
@@ -533,6 +453,23 @@ class UIBot:
         except Exception:
             pass
 
+    def shot(self, tag, vx, vy):
+        """复选框周边截图 → base64 分行打进日志（runner 现场取证,
+        事后可 base64 解码保存为 jpeg 查看; CDP 截图含 iframe 内部像素）"""
+        try:
+            clip = {"x": max(0, vx - 90), "y": max(0, vy - 45),
+                    "width": 260, "height": 130, "scale": 1}
+            b64 = self.d.execute_cdp_cmd(
+                "Page.captureScreenshot",
+                {"format": "jpeg", "quality": 40,
+                 "clip": clip}).get("data")
+            if b64:
+                log(f"   [shot:{tag}] jpeg/base64 ↓")
+                for i in range(0, len(b64), 3600):
+                    log("     " + b64[i:i + 3600])
+        except Exception as e:
+            log(f"   [shot:{tag}] 截图失败: {str(e)[:50]}")
+
     # ---- 主流程 ----
 
     def process(self):
@@ -667,12 +604,15 @@ class UIBot:
         """React 面板续期（exp24 实测成功配方, 2026-10-26）
         关键要素（24 轮实验结论, 缺一不可）:
           1. 运行时点击校准: pyautogui 投递坐标 vs 渲染坐标有漂移(公式差40px+)
-             → 点击视口中心, document 捕获阶段记录实际落点计算偏移
+             → 点击无交互安全点, document 捕获阶段记录实际落点计算偏移
           2. 页面预热 50s 拟人漫游: 会话页龄越长点击越易被 Bestcap 接受
-          3. 对话框 iframe 区域内漫游 60s 再点击: #glyphs 行为采集需轨迹数据
-          4. 多段逼近轨迹 + 90ms 按压的物理点击（isTrusted）
-          5. idle→working→idle 复位后: iframe 内小漫游 20s + 自动重点(≤5次/轮)
-          6. 结果验证走 requests 侧: 页面内 fetch 被 mock 时返回陈旧数据
+          3. 对话框 iframe 区域内漫游 45~70s 再点击: #glyphs 行为采集需轨迹
+          4. 点击前重测 iframe 位置（漫游期间对话框可能移位）
+          5. 多段逼近轨迹 + 90ms 按压的物理点击（isTrusted）
+          6. 哑弹救援: 点击 30s 后 rec 仍空（点击没送达复选框）→ 重测后重点
+          7. idle→working→idle 复位后: iframe 内小漫游 20s + 自动重点(≤5次/轮)
+          8. 结果验证走 requests 侧: 页面内 fetch 被 mock 时返回陈旧数据
+          9. 心跳日志/截图取证（shot(): base64 打进日志, 事后解码可看现场）
         """
         d, sb = self.d, self.sb
         # bestcap.js 就绪检查（脚本加载失败时重载页面最多 2 次）
@@ -723,24 +663,44 @@ class UIBot:
         pyautogui.PAUSE = 0.03
 
         # ---- 1. 运行时点击校准（document 捕获实际落点）----
+        # 校准点击目标避开交互元素（视口中心可能正对按钮/链接），
+        # 先用 elementFromPoint 在中心附近找一个无交互安全点再点击
         off = None
         for _ in range(6):
             try:
-                d.execute_script(
-                    "window.__land = null;"
-                    "window.__calH = function(e) {"
-                    " window.__land = {x: e.clientX, y: e.clientY}; };"
-                    "document.addEventListener('click', window.__calH, true);"
-                    "window.scrollTo(0,0);")
+                d.execute_script("window.scrollTo(0,0);")
                 g = json.loads(d.execute_script(
                     "return JSON.stringify({sx:window.screenX,"
                     "sy:window.screenY,ow:window.outerWidth,"
                     "oh:window.outerHeight,iw:window.innerWidth,"
                     "ih:window.innerHeight});"))
+                safe = json.loads(d.execute_script(
+                    "const bad = el => !el || el.closest"
+                    "('button,a,input,textarea,select,"
+                    "[role=button],[onclick],iframe');"
+                    "const pts = [];"
+                    "for (const fx of [.42,.5,.58,.66,.34,.74,.26,.82])"
+                    " for (const fy of [.42,.55,.68,.32,.78,.24])"
+                    "  pts.push([innerWidth*fx, innerHeight*fy]);"
+                    "for (const [x,y] of pts) {"
+                    " const el = document.elementFromPoint(x,y);"
+                    " if (!bad(el)) return JSON.stringify"
+                    "({x:x,y:y,tag:el.tagName}); }"
+                    "return JSON.stringify({x:innerWidth*.5,"
+                    " y:innerHeight*.5,tag:'fallback'});"))
             except Exception:
                 break
-            est_x = g["sx"] + (g["ow"] - g["iw"]) / 2 + g["iw"] / 2
-            est_y = g["sy"] + (g["oh"] - g["ih"]) + g["ih"] / 2
+            px, py = safe["x"], safe["y"]
+            est_x = g["sx"] + (g["ow"] - g["iw"]) / 2 + px
+            est_y = g["sy"] + (g["oh"] - g["ih"]) + py
+            d.execute_script(
+                "window.__land = null;"
+                "window.__landTg = null;"
+                "window.__calH = function(e) {"
+                " window.__land = {x: e.clientX, y: e.clientY};"
+                " window.__landTg = e.target ? e.target.tagName +"
+                " (e.target.id ? '#' + e.target.id : '') : '?'; };"
+                "document.addEventListener('click', window.__calH, true);")
             pyautogui.moveTo(int(est_x), int(est_y), duration=0.25)
             time.sleep(0.1)
             pyautogui.mouseDown()
@@ -748,20 +708,27 @@ class UIBot:
             pyautogui.mouseUp()
             time.sleep(0.7)
             try:
-                land = d.execute_script("return window.__land")
+                land_j = d.execute_script(
+                    "return JSON.stringify({p: window.__land,"
+                    " tg: window.__landTg});")
                 d.execute_script(
                     "document.removeEventListener('click',"
                     " window.__calH, true);")
             except Exception:
-                land = None
-            if land:
-                off = (est_x - land["x"], est_y - land["y"])
-                break
+                land_j = None
+            if land_j:
+                lj = json.loads(land_j)
+                if lj.get("p"):
+                    off = (est_x - lj["p"]["x"], est_y - lj["p"]["y"])
+                    log(f"   [{name}] ✅ 校准偏移 ({off[0]:+.0f},"
+                        f"{off[1]:+.0f}) | 校准落点元素={lj.get('tg')}"
+                        f" | 安全点=({px:.0f},{py:.0f})"
+                        f" | 视口 {g['iw']}x{g['ih']}")
+                    break
             time.sleep(1.5)
         if not off:
             return False, "❌ 点击校准失败（物理坐标映射不可用）"
         off_x, off_y = off
-        log(f"   [{name}] ✅ 校准偏移 ({off_x:+.0f},{off_y:+.0f})")
 
         # ---- 2. 页面预热 50s（拟人漫游, 喂行为采集 + 提高页龄）----
         log(f"   [{name}] 🖱 页面预热 50s ...")
@@ -772,8 +739,8 @@ class UIBot:
             pyautogui.moveTo(tx, ty, duration=random.uniform(0.2, 0.5))
             time.sleep(random.uniform(0.15, 0.5))
 
-        # ---- 3. 主循环: 最多 4 轮 ----
-        for rnd in range(1, 5):
+        # ---- 3. 主循环: 最多 5 轮（exp24 同款; 漫游时长/轨迹带随机抖动）----
+        for rnd in range(1, 6):
             log(f"   [{name}] ===== 第 {rnd} 轮 =====")
             self.inject_all()
             self.clear_overlays()
@@ -894,11 +861,12 @@ class UIBot:
             # ---- 4. 关键: iframe 区域内拟人漫游 60s（行为采集窗口）----
             fx0 = ifr["x"] + off_x
             fy0 = ifr["y"] + off_y
+            roam_s = random.uniform(45, 70)
             ccx_ = fx0 + chk["x"] + chk["w"] / 2
             ccy_ = fy0 + chk["y"] + chk["h"] / 2
-            log(f"   [{name}] 🖱 iframe 区域漫游 60s ...")
+            log(f"   [{name}] 🖱 iframe 区域漫游 {roam_s:.0f}s ...")
             wt0 = time.time()
-            while time.time() - wt0 < 60:
+            while time.time() - wt0 < roam_s:
                 if random.random() < 0.5:
                     tx = ccx_ + random.uniform(-50, 200)
                     ty = ccy_ + random.uniform(-35, 45)
@@ -911,10 +879,42 @@ class UIBot:
                                  duration=random.uniform(0.15, 0.45))
                 time.sleep(random.uniform(0.1, 0.4))
 
-            # ---- 5. 多段逼近轨迹 + 物理点击 ----
+            # ---- 5. 点击前重测 iframe 位置（漫游期间对话框可能移位）----
+            try:
+                ifr2 = json.loads(d.execute_script(
+                    "const f=[...document.querySelectorAll("
+                    "\"iframe[src*='vyceai']\")][0];"
+                    "if(!f) return null;"
+                    "const r=f.getBoundingClientRect();"
+                    "return JSON.stringify({x:r.x,y:r.y,w:r.width,"
+                    "h:r.height});"))
+                if ifr2 and (abs(ifr2["x"] - ifr["x"]) > 8
+                             or abs(ifr2["y"] - ifr["y"]) > 8):
+                    log(f"   [{name}] ⚠️ iframe 移位 "
+                        f"({ifr['x']:.0f},{ifr['y']:.0f}) → "
+                        f"({ifr2['x']:.0f},{ifr2['y']:.0f})，按新位置点击")
+                    ifr = ifr2
+                    fx0 = ifr["x"] + off_x
+                    fy0 = ifr["y"] + off_y
+            except Exception:
+                pass
+            # 多段逼近轨迹 + 物理点击
             cx = ifr["x"] + chk["x"] + chk["w"] / 2
             cy = ifr["y"] + chk["y"] + chk["h"] / 2
             sx, sy = cx + off_x, cy + off_y
+            try:
+                cover = d.execute_script(
+                    "const el = document.elementFromPoint("
+                    "arguments[0], arguments[1]);"
+                    "return el ? el.tagName + "
+                    "'[' + (el.getAttribute('src') || '') + ']'"
+                    " : 'none';", cx, cy)
+            except Exception:
+                cover = "?"
+            log(f"   [{name}] 🎯 目标: iframe=({ifr['x']:.0f},"
+                f"{ifr['y']:.0f}) 复选框中心=({cx:.0f},{cy:.0f})"
+                f" → 屏幕({sx:.0f},{sy:.0f}) | 覆盖检测: {cover}")
+            self.shot(f"r{rnd}-点击前", cx, cy)
             try:
                 x0 = sx - random.randint(150, 250)
                 y0 = sy - random.randint(90, 140)
@@ -934,17 +934,23 @@ class UIBot:
                 time.sleep(0.09)
                 pyautogui.mouseUp()
                 log(f"   [{name}] ✅ 物理点击 ({sx:.0f},{sy:.0f})")
+                self.shot(f"r{rnd}-点击后", cx, cy)
             except Exception as e:
                 log(f"   [{name}] 点击异常: {e}")
                 continue
 
-            # ---- 6. 等结果（200s, 复位自动重点）----
+            # ---- 6. 等结果（210s, 心跳日志 + 哑弹救援 + 复位自动重点）----
             t0 = time.time()
             last_st = "idle"
             n_clicks = 1
-            while time.time() - t0 < 200:
+            last_click_t = time.time()
+            polls_ok = polls_fail = 0
+            hb = 0
+            while time.time() - t0 < 210:
                 time.sleep(7)
+                hb += 1
                 # iframe 组件状态 + 点击可信记录
+                snap = None
                 try:
                     d.switch_to.frame(frame)
                     snap = d.execute_script(
@@ -953,37 +959,114 @@ class UIBot:
                         " st: c ? c.getAttribute('data-state') : null,"
                         " rec: window.__rec || []});")
                     d.switch_to.default_content()
-                    j = json.loads(snap or "{}")
-                    if j.get("st") and j["st"] != last_st:
-                        log(f"   [{name}] 状态: {last_st} → {j['st']}"
-                            f" (点击#{n_clicks}) | {j.get('rec')}")
-                        last_st = j["st"]
-                        if j["st"] == "idle" and n_clicks < 5:
-                            # 点击被吃掉后回 idle（验证被拒）→ 小漫游后重点
-                            time.sleep(10)
-                            wt1 = time.time()
-                            while time.time() - wt1 < 20:
-                                tx = fx0 + random.uniform(
-                                    5, max(10, ifr["w"] - 5))
-                                ty = fy0 + random.uniform(
-                                    5, max(10, ifr["h"] - 5))
-                                pyautogui.moveTo(
-                                    tx, ty,
-                                    duration=random.uniform(0.15, 0.4))
-                                time.sleep(random.uniform(0.1, 0.35))
-                            pyautogui.moveTo(int(sx), int(sy),
-                                             duration=0.2)
-                            time.sleep(0.25)
-                            pyautogui.mouseDown()
-                            time.sleep(0.09)
-                            pyautogui.mouseUp()
-                            n_clicks += 1
-                            log(f"   [{name}] 🔁 复位重点 #{n_clicks}")
+                    polls_ok += 1
                 except Exception:
+                    polls_fail += 1
                     try:
                         d.switch_to.default_content()
                     except Exception:
                         pass
+                st_now, rec_now = "null", []
+                try:
+                    j = json.loads(snap or "{}")
+                    st_now = j.get("st") or "null"
+                    rec_now = j.get("rec") or []
+                except Exception:
+                    pass
+                if st_now != last_st:
+                    log(f"   [{name}] 状态: {last_st} → {st_now}"
+                        f" (点击#{n_clicks}) | rec={rec_now}")
+                    prev_st = last_st
+                    last_st = st_now
+                    if st_now == "idle" and prev_st != "idle" \
+                            and n_clicks < 5:
+                        # 验证被拒回 idle → 小漫游后重点（exp24 配方）
+                        time.sleep(10)
+                        wt1 = time.time()
+                        while time.time() - wt1 < 20:
+                            tx = fx0 + random.uniform(
+                                5, max(10, ifr["w"] - 5))
+                            ty = fy0 + random.uniform(
+                                5, max(10, ifr["h"] - 5))
+                            pyautogui.moveTo(
+                                tx, ty,
+                                duration=random.uniform(0.15, 0.4))
+                            time.sleep(random.uniform(0.1, 0.35))
+                        pyautogui.moveTo(int(sx), int(sy),
+                                         duration=0.2)
+                        time.sleep(0.25)
+                        pyautogui.mouseDown()
+                        time.sleep(0.09)
+                        pyautogui.mouseUp()
+                        n_clicks += 1
+                        last_click_t = time.time()
+                        log(f"   [{name}] 🔁 复位重点 #{n_clicks}")
+                elif (not rec_now and n_clicks < 5
+                        and st_now in ("idle", "null")
+                        and time.time() - last_click_t > 30):
+                    # 哑弹救援: 点击 30s 后复选框仍无 rec（点击根本没
+                    # 送达）→ 重测 iframe/复选框位置后重点
+                    log(f"   [{name}] ⚠️ 点击#{n_clicks} 疑似哑弹"
+                        f"(rec空, st={st_now}) → 重测位置后重点")
+                    try:
+                        ifr2 = json.loads(d.execute_script(
+                            "const f=[...document.querySelectorAll("
+                            "\"iframe[src*='vyceai']\")][0];"
+                            "if(!f) return null;"
+                            "const r=f.getBoundingClientRect();"
+                            "return JSON.stringify({x:r.x,y:r.y,"
+                            "w:r.width,h:r.height});"))
+                        if ifr2:
+                            ifr = ifr2
+                            fx0 = ifr["x"] + off_x
+                            fy0 = ifr["y"] + off_y
+                        d.switch_to.frame(frame)
+                        r2 = d.execute_script(
+                            "const c=document.getElementById('check');"
+                            "if(!c) return null;"
+                            "const b=c.getBoundingClientRect();"
+                            "return JSON.stringify({x:b.x,y:b.y,"
+                            "w:b.width,h:b.height});")
+                        d.switch_to.default_content()
+                        if r2:
+                            chk = json.loads(r2)
+                    except Exception:
+                        try:
+                            d.switch_to.default_content()
+                        except Exception:
+                            pass
+                    cx = ifr["x"] + chk["x"] + chk["w"] / 2
+                    cy = ifr["y"] + chk["y"] + chk["h"] / 2
+                    sx, sy = cx + off_x, cy + off_y
+                    wt1 = time.time()
+                    while time.time() - wt1 < 12:
+                        pyautogui.moveTo(
+                            fx0 + random.uniform(
+                                5, max(10, ifr["w"] - 5)),
+                            fy0 + random.uniform(
+                                5, max(10, ifr["h"] - 5)),
+                            duration=random.uniform(0.15, 0.4))
+                        time.sleep(random.uniform(0.1, 0.3))
+                    pyautogui.moveTo(int(sx), int(sy), duration=0.2)
+                    time.sleep(0.25)
+                    pyautogui.mouseDown()
+                    time.sleep(0.09)
+                    pyautogui.mouseUp()
+                    n_clicks += 1
+                    last_click_t = time.time()
+                    log(f"   [{name}] 🔁 哑弹救援重点 #{n_clicks} "
+                        f"({sx:.0f},{sy:.0f})")
+                    self.shot(f"r{rnd}-救援{n_clicks}", cx, cy)
+                # 心跳日志: 每 21s 汇报观测值（诊断点击送达/轮询健康）
+                if hb % 3 == 0:
+                    try:
+                        hb_resp = d.execute_script(
+                            "return window.__renewResp || null;")
+                    except Exception:
+                        hb_resp = None
+                    log(f"   [{name}] 💓 st={st_now} rec数={len(rec_now)}"
+                        f" 轮询ok/失败={polls_ok}/{polls_fail}"
+                        f" renewResp={str(hb_resp)[:70]}")
                 # 续期响应 hook（429 冷却判定）
                 try:
                     resp = d.execute_script(
@@ -1003,6 +1086,10 @@ class UIBot:
                         log(f"   [{name}] ✅ expiresAt → "
                             f"{s['expiresAt']}")
                         return True, "✅ 续期成功（浏览器过验证码）"
+            if polls_fail and not polls_ok:
+                log(f"   [{name}] ⚠️ 本轮状态轮询全部失败({polls_fail}次)"
+                    f"——frame 句柄可能已失效")
+            self.shot(f"r{rnd}-轮末", cx, cy)
             # 本轮失败: Esc 关对话框再战
             try:
                 d.execute_script(
@@ -1314,13 +1401,13 @@ def aggregate_exit(results):
 def main():
     parser = argparse.ArgumentParser(description="vyce.cloud 自动续期保活")
     parser.add_argument("--mode", choices=["requests", "selenium", "auto"],
-                        default="auto", help="requests=纯API / selenium=浏览器 / auto=API优先+自动兜底")
+                        default="auto", help="requests=纯API检查(不发起续期) / selenium=浏览器续期 / auto=检查+自动兜底")
     args = parser.parse_args()
     mode = args.mode
 
     log("#" * 46)
     log("  vycecloud — vyce.cloud 自动续期")
-    log(f"  模式: {mode} | 续期阈值: {RENEW_THRESHOLD_H}h")
+    log(f"  模式: {mode} | 检查阈值: {RENEW_THRESHOLD_H}h | 续期: 浏览器 UI（Bestcap 验证码）")
     log("#" * 46)
 
     accounts = load_accounts()
@@ -1333,9 +1420,9 @@ def main():
         results = [process_account(RequestsTransport(a["sid"]), a) for a in accounts]
         exit_code = aggregate_exit(results)
         if exit_code == 0:
-            notify(results, "API")
+            notify(results, "检查")
         elif exit_code == 2:
-            log("⚠️ API 模式疑似被拦截（退出码 2）")
+            log("🔁 有服务器需续期（退出码 2）→ 须浏览器模式过 Bestcap 验证码")
             if mode == "requests":
                 log("   → 按 workflow 设计交由浏览器模式兜底，本进程不重复推送通知")
                 sys.exit(2)
@@ -1353,7 +1440,7 @@ def main():
                 log(f"   ⚠️ 浏览器模式异常: {e}")
                 sys.exit(2)
         else:
-            notify(results, "API")
+            notify(results, "检查")
             sys.exit(exit_code)
 
     # selenium 模式（显式指定或被 workflow 兜底调用）
